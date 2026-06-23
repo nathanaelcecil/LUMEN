@@ -352,18 +352,22 @@ def _extract_youtube_id(url: str) -> Optional[str]:
 def _fetch_youtube_transcript(video_id: str) -> str:
     """Fetch transcript via youtube-transcript-api and return as plain text."""
     from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
+    # v0.6+ uses instance-based API; v0.5 used class methods — support both
     try:
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
+        # Pick English first, then fall back to first available
+        try:
+            transcript = transcript_list.find_transcript(["en", "en-US", "en-GB"])
+        except Exception:
+            transcript = next(iter(transcript_list))
+        fetched = transcript.fetch()
+        entries = [{"start": s.start, "text": s.text} for s in fetched]
+    except Exception:
+        # Fallback for older API versions
         entries = YouTubeTranscriptApi.get_transcript(video_id)
-    except NoTranscriptFound:
-        # Try any available language as fallback
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript = transcript_list.find_transcript(
-            [t.language_code for t in transcript_list]
-        )
-        entries = transcript.fetch()
-    
+
     # Format as timestamped plain text so Gemini can build the transcript field
     lines = []
     for entry in entries:
