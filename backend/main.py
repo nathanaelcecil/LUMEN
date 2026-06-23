@@ -682,3 +682,24 @@ async def delete_workspace(ws_id: str):
         await db.execute("DELETE FROM workspaces WHERE id=?", (ws_id,))
         await db.commit()
     return {"deleted": ws_id}
+
+
+@app.get("/api/debug/youtube/{video_id}")
+async def debug_youtube(video_id: str):
+    """Debug: see exactly what YouTube returns to Render's IP."""
+    import urllib.request
+    import re as _re2
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    req = urllib.request.Request(f"https://www.youtube.com/watch?v={video_id}", headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+    return {
+        "has_captionTracks": bool(_re2.search(r'"captionTracks"', html)),
+        "has_consent_page": "consent" in html.lower() or "before you continue" in html.lower(),
+        "has_signin": "sign in" in html.lower(),
+        "html_length": len(html),
+        "html_snippet": html[:500],
+    }
