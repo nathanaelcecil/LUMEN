@@ -330,8 +330,23 @@ import re as _re
 
 def _extract_youtube_id(url: str) -> Optional[str]:
     """Return the 11-char video ID from any YouTube URL, or None."""
-    match = _re.search(r"(?:v=|youtu\.be/|/embed/|/shorts/)([0-9A-Za-z_-]{11})", url)
-    return match.group(1) if match else None
+    if not _re.search(r"(youtube\.com|youtu\.be)", url, _re.IGNORECASE):
+        return None
+    patterns = [
+        r"[?&]v=([0-9A-Za-z_-]{11})",
+        r"youtu\.be/([0-9A-Za-z_-]{11})",
+        r"/embed/([0-9A-Za-z_-]{11})",
+        r"/shorts/([0-9A-Za-z_-]{11})",
+        r"/v/([0-9A-Za-z_-]{11})",
+    ]
+    for pattern in patterns:
+        match = _re.search(pattern, url)
+        if match:
+            video_id = match.group(1)
+            print(f"[DEBUG] Detected YouTube video_id={video_id} from url={url}")
+            return video_id
+    print(f"[DEBUG] YouTube URL detected but no video ID extracted: {url}")
+    return None
 
 
 def _fetch_youtube_transcript(video_id: str) -> str:
