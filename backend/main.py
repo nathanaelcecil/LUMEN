@@ -346,15 +346,27 @@ def _extract_youtube_id(url: str):
 
 
 def _fetch_youtube_transcript(video_id: str) -> str:
-    """Fetch transcript via youtube-transcript-api v1.2.4 and return timestamped text."""
+    """Fetch transcript via youtube-transcript-api v1.2.4 and return timestamped text.
+    Uses Webshare rotating residential proxy to bypass cloud IP blocks."""
     from youtube_transcript_api import YouTubeTranscriptApi
-    api = YouTubeTranscriptApi()
+    from youtube_transcript_api.proxies import WebshareProxyConfig
+
+    proxy_username = os.getenv("WEBSHARE_USERNAME", "njszgbei")
+    proxy_password = os.getenv("WEBSHARE_PASSWORD", "enjsjmjl8qpz")
+
+    proxy_config = WebshareProxyConfig(
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
+    )
+    api = YouTubeTranscriptApi(proxy_config=proxy_config)
+
     try:
         fetched = api.fetch(video_id, languages=["en", "en-US", "en-GB"])
     except Exception:
         # Fall back to first available language
         transcript_list = api.list(video_id)
         fetched = next(iter(transcript_list)).fetch()
+
     lines = []
     for snippet in fetched:
         secs = int(snippet.start)
