@@ -320,182 +320,114 @@ async def transcribe_and_analyse(ws_id: str, file_path: Path, source_name: str):
             pass
 
 
+import re as _re
+
 def _ydl_download(url: str, opts: dict):
     import yt_dlp  # noqa: PLC0415
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
 
-import re as _re
-
-def _extract_youtube_id(url: str) -> Optional[str]:
+def _extract_youtube_id(url: str):
     """Return the 11-char video ID from any YouTube URL, or None."""
     if not _re.search(r"(youtube\.com|youtu\.be)", url, _re.IGNORECASE):
         return None
-    patterns = [
+    for pattern in [
         r"[?&]v=([0-9A-Za-z_-]{11})",
         r"youtu\.be/([0-9A-Za-z_-]{11})",
         r"/embed/([0-9A-Za-z_-]{11})",
         r"/shorts/([0-9A-Za-z_-]{11})",
         r"/v/([0-9A-Za-z_-]{11})",
-    ]
-    for pattern in patterns:
-        match = _re.search(pattern, url)
-        if match:
-            video_id = match.group(1)
-            print(f"[DEBUG] Detected YouTube video_id={video_id} from url={url}")
-            return video_id
-    print(f"[DEBUG] YouTube URL detected but no video ID extracted: {url}")
+    ]:
+        m = _re.search(pattern, url)
+        if m:
+            return m.group(1)
     return None
 
 
 def _fetch_youtube_transcript(video_id: str) -> str:
-    """Fetch transcript via youtube-transcript-api and return as plain text."""
+    """Fetch transcript via youtube-transcript-api v1.2.4 and return timestamped text."""
     from youtube_transcript_api import YouTubeTranscriptApi
-
-    # v0.6+ uses instance-based API; v0.5 used class methods — support both
+    api = YouTubeTranscriptApi()
     try:
-        api = YouTubeTranscriptApi()
-        transcript_list = api.list(video_id)
-        # Pick English first, then fall back to first available
-        try:
-            transcript = transcript_list.find_transcript(["en", "en-US", "en-GB"])
-        except Exception:
-            transcript = next(iter(transcript_list))
-        fetched = transcript.fetch()
-        entries = [{"start": s.start, "text": s.text} for s in fetched]
+        fetched = api.fetch(video_id, languages=["en", "en-US", "en-GB"])
     except Exception:
-        # Fallback for older API versions
-        entries = YouTubeTranscriptApi.get_transcript(video_id)
-
-    # Format as timestamped plain text so Gemini can build the transcript field
+        # Fall back to first available language
+        transcript_list = api.list(video_id)
+        fetched = next(iter(transcript_list)).fetch()
     lines = []
-    for entry in entries:
-        secs = int(entry["start"])
+    for snippet in fetched:
+        secs = int(snippet.start)
         mins, s = divmod(secs, 60)
-        lines.append(f"[{mins}:{s:02d}] {entry['text']}")
+        lines.append(f"[{mins}:{s:02d}] {snippet.text}")
     return "\n".join(lines)
 
 
-TRANSCRIPT_ANALYSIS_PROMPT = """
+TRANSCRIPT_PROMPT = """
 You are an expert educational content analyst. Analyse this video transcript.
-Your job is to extract rich, structured learning material from it.
-
-The transcript below contains timestamped lines in the format [M:SS] text.
-
 Return ONLY valid JSON (no markdown, no explanation) matching this exact schema:
 
 {
-  "title": "string — concise video title",
-  "summary": "string — 2-3 sentence plain-English summary",
-  "duration": "string — estimated duration like '12:34', derive from last transcript timestamp",
+  "title": "string",
+  "summary": "string — 2-3 sentence summary",
+  "duration": "string — e.g. '12:34', from last transcript timestamp",
   "thumbnail": "",
-  "keyTakeaways": ["string", ...],
-  "learningObjectives": ["string", ...],
-  "chapters": [
-    {
-      "id": "c1",
-      "timestamp": "0:00",
-      "seconds": 0,
-      "title": "string",
-      "summary": "string"
-    }
-  ],
-  "slides": [
-    {
-      "id": "s1",
-      "index": 1,
-      "chapterId": "c1",
-      "chapterLabel": "Chapter 1 — <title>",
-      "title": "string",
-      "bullets": ["string", "string", "string", "string"],
-      "keyTakeaway": "string",
-      "quote": "string or omit",
-      "imageQuery": "short search query for an illustration"
-    }
-  ],
+  "keyTakeaways": ["string"],
+  "learningObjectives": ["string"],
+  "chapters": [{"id":"c1","timestamp":"0:00","seconds":0,"title":"string","summary":"string"}],
+  "slides": [{"id":"s1","index":1,"chapterId":"c1","chapterLabel":"string","title":"string","bullets":["string"],"keyTakeaway":"string","imageQuery":"string"}],
   "report": {
-    "executiveSummary": "string",
-    "learningObjectives": ["string", ...],
-    "chapterBreakdown": [{"chapterId": "c1", "narrative": "string"}, ...],
-    "concepts": [
-      {"id": "k1", "term": "string", "explanation": "string", "example": "string"}
-    ],
-    "realWorldApplications": ["string", ...],
-    "quotes": [{"id": "q1", "quote": "string", "context": "string"}, ...],
-    "keyInsights": ["string", ...],
-    "actionableTakeaways": ["string", ...],
-    "conclusion": "string"
+    "executiveSummary":"string","learningObjectives":["string"],
+    "chapterBreakdown":[{"chapterId":"c1","narrative":"string"}],
+    "concepts":[{"id":"k1","term":"string","explanation":"string","example":"string"}],
+    "realWorldApplications":["string"],"quotes":[{"id":"q1","quote":"string","context":"string"}],
+    "keyInsights":["string"],"actionableTakeaways":["string"],"conclusion":"string"
   },
   "studyNotes": {
-    "learningObjectives": ["string", ...],
-    "keyConcepts": [{"heading": "string", "body": "string"}, ...],
-    "definitions": [{"term": "string", "definition": "string"}, ...],
-    "importantFacts": ["string", ...],
-    "examples": [{"title": "string", "body": "string"}, ...],
-    "revisionNotes": ["string", ...],
-    "examTips": ["string", ...],
-    "finalSummary": "string"
+    "learningObjectives":["string"],"keyConcepts":[{"heading":"string","body":"string"}],
+    "definitions":[{"term":"string","definition":"string"}],"importantFacts":["string"],
+    "examples":[{"title":"string","body":"string"}],"revisionNotes":["string"],
+    "examTips":["string"],"finalSummary":"string"
   },
-  "flashcards": [
-    {"id": "f1", "front": "string", "back": "string"}
-  ],
-  "quiz": [
-    {
-      "id": "q1",
-      "question": "string",
-      "options": ["string", "string", "string", "string"],
-      "correctIndex": 0
-    }
-  ],
-  "transcript": [
-    {"time": "0:00", "seconds": 0, "text": "string"}
-  ],
-  "knowledgeGraph": [
-    {"id": "n1", "label": "string", "kind": "topic", "relatedTo": ["n2"]}
-  ]
+  "flashcards": [{"id":"f1","front":"string","back":"string"}],
+  "quiz": [{"id":"q1","question":"string","options":["string","string","string","string"],"correctIndex":0}],
+  "transcript": [{"time":"0:00","seconds":0,"text":"string"}],
+  "knowledgeGraph": [{"id":"n1","label":"string","kind":"topic","relatedTo":["n2"]}]
 }
 
 Rules:
-- Generate chapters naturally based on when topics actually change (minimum 3).
-- Generate ONE slide per chapter — no more, no fewer.
-- Slide imageQuery: write a descriptive 5-10 word search query for a helpful illustration.
-- Generate at least 8 flashcards and 5 quiz questions.
-- Every chapter MUST have a corresponding slide with matching chapterId.
-- Populate the transcript field from the timestamped lines provided.
+- Chapters: minimum 3, based on natural topic changes.
+- Slides: one per chapter, no more no less.
+- Flashcards: at least 8. Quiz: at least 5 questions.
+- Populate transcript from the timestamped lines provided.
 - knowledgeGraph: 6-12 nodes.
-- Return ONLY the JSON object — nothing else.
+- Return ONLY the JSON object.
 
 TRANSCRIPT:
 """
 
 
 async def analyse_youtube_url(ws_id: str, url: str, video_id: str):
-    """Use youtube-transcript-api + Gemini text analysis (no video download needed)."""
+    """Use transcript API for YouTube — no video download needed."""
     try:
         if not client:
             raise RuntimeError("GEMINI_API_KEY not configured on server")
 
         await set_stage(ws_id, "transcribing")
-
         loop = asyncio.get_event_loop()
         transcript_text = await loop.run_in_executor(
             None, lambda: _fetch_youtube_transcript(video_id)
         )
-
         if not transcript_text.strip():
-            raise RuntimeError("Transcript is empty — the video may have no captions.")
+            raise RuntimeError("Transcript is empty — video may have no captions.")
 
         print(f"=== TRANSCRIPT FETCHED | ws={ws_id} chars={len(transcript_text)} ===")
 
         await set_stage(ws_id, "analyzing")
-
-        full_prompt = TRANSCRIPT_ANALYSIS_PROMPT + transcript_text
-
         analysis_resp = await gemini_generate_with_retry(
             lambda: client.models.generate_content(
                 model=GEMINI_MODEL,
-                contents=[full_prompt],
+                contents=[TRANSCRIPT_PROMPT + transcript_text],
             )
         )
 
@@ -507,12 +439,11 @@ async def analyse_youtube_url(ws_id: str, url: str, video_id: str):
                 raw = raw[4:]
             raw = raw.rsplit("```", 1)[0].strip()
 
-        workspace_data: dict = json.loads(raw)
+        workspace_data = json.loads(raw)
         workspace_data["id"]        = ws_id
         workspace_data["createdAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         workspace_data["source"]    = url
-        if not workspace_data.get("thumbnail"):
-            workspace_data["thumbnail"] = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+        workspace_data["thumbnail"] = workspace_data.get("thumbnail") or f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
         await save_workspace(ws_id, workspace_data)
 
@@ -523,14 +454,14 @@ async def analyse_youtube_url(ws_id: str, url: str, video_id: str):
 
 
 async def analyse_url(ws_id: str, url: str):
-    """Route to YouTube transcript path or yt-dlp download path."""
+    """Route YouTube URLs to transcript path; everything else uses yt-dlp."""
     video_id = _extract_youtube_id(url)
     if video_id:
-        # Fast path: no download needed, use transcript API
+        print(f"=== YOUTUBE DETECTED | video_id={video_id} ===")
         await analyse_youtube_url(ws_id, url, video_id)
         return
 
-    # Non-YouTube URLs: download via yt-dlp as before
+    # Non-YouTube: download via yt-dlp as before
     try:
         await set_stage(ws_id, "uploading")
 
