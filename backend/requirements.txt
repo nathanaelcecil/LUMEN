@@ -6,3 +6,4 @@ yt-dlp>=2025.6.9
 aiofiles==24.1.0
 aiosqlite==0.20.0
 python-dotenv==1.0.1
+youtube-transcript-api>=0.6.3

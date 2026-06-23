@@ -326,19 +326,201 @@ def _ydl_download(url: str, opts: dict):
         ydl.download([url])
 
 
+import re as _re
+
+def _extract_youtube_id(url: str) -> Optional[str]:
+    """Return the 11-char video ID from any YouTube URL, or None."""
+    match = _re.search(r"(?:v=|youtu\.be/|/embed/|/shorts/)([0-9A-Za-z_-]{11})", url)
+    return match.group(1) if match else None
+
+
+def _fetch_youtube_transcript(video_id: str) -> str:
+    """Fetch transcript via youtube-transcript-api and return as plain text."""
+    from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+
+    try:
+        entries = YouTubeTranscriptApi.get_transcript(video_id)
+    except NoTranscriptFound:
+        # Try any available language as fallback
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript = transcript_list.find_transcript(
+            [t.language_code for t in transcript_list]
+        )
+        entries = transcript.fetch()
+    
+    # Format as timestamped plain text so Gemini can build the transcript field
+    lines = []
+    for entry in entries:
+        secs = int(entry["start"])
+        mins, s = divmod(secs, 60)
+        lines.append(f"[{mins}:{s:02d}] {entry['text']}")
+    return "\n".join(lines)
+
+
+TRANSCRIPT_ANALYSIS_PROMPT = """
+You are an expert educational content analyst. Analyse this video transcript.
+Your job is to extract rich, structured learning material from it.
+
+The transcript below contains timestamped lines in the format [M:SS] text.
+
+Return ONLY valid JSON (no markdown, no explanation) matching this exact schema:
+
+{
+  "title": "string — concise video title",
+  "summary": "string — 2-3 sentence plain-English summary",
+  "duration": "string — estimated duration like '12:34', derive from last transcript timestamp",
+  "thumbnail": "",
+  "keyTakeaways": ["string", ...],
+  "learningObjectives": ["string", ...],
+  "chapters": [
+    {
+      "id": "c1",
+      "timestamp": "0:00",
+      "seconds": 0,
+      "title": "string",
+      "summary": "string"
+    }
+  ],
+  "slides": [
+    {
+      "id": "s1",
+      "index": 1,
+      "chapterId": "c1",
+      "chapterLabel": "Chapter 1 — <title>",
+      "title": "string",
+      "bullets": ["string", "string", "string", "string"],
+      "keyTakeaway": "string",
+      "quote": "string or omit",
+      "imageQuery": "short search query for an illustration"
+    }
+  ],
+  "report": {
+    "executiveSummary": "string",
+    "learningObjectives": ["string", ...],
+    "chapterBreakdown": [{"chapterId": "c1", "narrative": "string"}, ...],
+    "concepts": [
+      {"id": "k1", "term": "string", "explanation": "string", "example": "string"}
+    ],
+    "realWorldApplications": ["string", ...],
+    "quotes": [{"id": "q1", "quote": "string", "context": "string"}, ...],
+    "keyInsights": ["string", ...],
+    "actionableTakeaways": ["string", ...],
+    "conclusion": "string"
+  },
+  "studyNotes": {
+    "learningObjectives": ["string", ...],
+    "keyConcepts": [{"heading": "string", "body": "string"}, ...],
+    "definitions": [{"term": "string", "definition": "string"}, ...],
+    "importantFacts": ["string", ...],
+    "examples": [{"title": "string", "body": "string"}, ...],
+    "revisionNotes": ["string", ...],
+    "examTips": ["string", ...],
+    "finalSummary": "string"
+  },
+  "flashcards": [
+    {"id": "f1", "front": "string", "back": "string"}
+  ],
+  "quiz": [
+    {
+      "id": "q1",
+      "question": "string",
+      "options": ["string", "string", "string", "string"],
+      "correctIndex": 0
+    }
+  ],
+  "transcript": [
+    {"time": "0:00", "seconds": 0, "text": "string"}
+  ],
+  "knowledgeGraph": [
+    {"id": "n1", "label": "string", "kind": "topic", "relatedTo": ["n2"]}
+  ]
+}
+
+Rules:
+- Generate chapters naturally based on when topics actually change (minimum 3).
+- Generate ONE slide per chapter — no more, no fewer.
+- Slide imageQuery: write a descriptive 5-10 word search query for a helpful illustration.
+- Generate at least 8 flashcards and 5 quiz questions.
+- Every chapter MUST have a corresponding slide with matching chapterId.
+- Populate the transcript field from the timestamped lines provided.
+- knowledgeGraph: 6-12 nodes.
+- Return ONLY the JSON object — nothing else.
+
+TRANSCRIPT:
+"""
+
+
+async def analyse_youtube_url(ws_id: str, url: str, video_id: str):
+    """Use youtube-transcript-api + Gemini text analysis (no video download needed)."""
+    try:
+        if not client:
+            raise RuntimeError("GEMINI_API_KEY not configured on server")
+
+        await set_stage(ws_id, "transcribing")
+
+        loop = asyncio.get_event_loop()
+        transcript_text = await loop.run_in_executor(
+            None, lambda: _fetch_youtube_transcript(video_id)
+        )
+
+        if not transcript_text.strip():
+            raise RuntimeError("Transcript is empty — the video may have no captions.")
+
+        print(f"=== TRANSCRIPT FETCHED | ws={ws_id} chars={len(transcript_text)} ===")
+
+        await set_stage(ws_id, "analyzing")
+
+        full_prompt = TRANSCRIPT_ANALYSIS_PROMPT + transcript_text
+
+        analysis_resp = await gemini_generate_with_retry(
+            lambda: client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[full_prompt],
+            )
+        )
+
+        await set_stage(ws_id, "structuring")
+        raw = analysis_resp.text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.rsplit("```", 1)[0].strip()
+
+        workspace_data: dict = json.loads(raw)
+        workspace_data["id"]        = ws_id
+        workspace_data["createdAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        workspace_data["source"]    = url
+        if not workspace_data.get("thumbnail"):
+            workspace_data["thumbnail"] = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+
+        await save_workspace(ws_id, workspace_data)
+
+    except Exception as exc:
+        tb = traceback.format_exc()
+        print(f"[ERROR] youtube workspace {ws_id}: {exc}\n{tb}")
+        await save_error(ws_id, str(exc))
+
+
 async def analyse_url(ws_id: str, url: str):
-    """Download via yt-dlp then run the same pipeline."""
+    """Route to YouTube transcript path or yt-dlp download path."""
+    video_id = _extract_youtube_id(url)
+    if video_id:
+        # Fast path: no download needed, use transcript API
+        await analyse_youtube_url(ws_id, url, video_id)
+        return
+
+    # Non-YouTube URLs: download via yt-dlp as before
     try:
         await set_stage(ws_id, "uploading")
 
         tmp = UPLOAD_DIR / f"{ws_id}.mp4"
         ydl_opts = {
-            # Prefer a format that Gemini accepts (H.264 mp4)
             "format": "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "outtmpl": str(tmp),
             "quiet": True,
             "no_warnings": True,
-            # Merge into mp4 so the extension is predictable
             "merge_output_format": "mp4",
         }
         loop = asyncio.get_event_loop()
