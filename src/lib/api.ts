@@ -29,12 +29,13 @@ export async function uploadVideo(file: File): Promise<string> {
   return json.workspaceId as string;
 }
 
-/** Submit a YouTube / video URL. Returns the new workspace id. */
-export async function submitUrl(url: string): Promise<string> {
+/** Submit a YouTube / video URL. Returns the new workspace id.
+ *  Pass `transcript` (plain timestamped text) to skip server-side fetching. */
+export async function submitUrl(url: string, transcript?: string): Promise<string> {
   const res = await fetch(`${BASE}/api/workspaces/url`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ url, ...(transcript ? { transcript } : {}) }),
   });
   if (!res.ok) throw new Error(`URL submit failed: ${res.status} ${await res.text()}`);
   const json = await res.json();

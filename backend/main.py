@@ -328,7 +328,7 @@ def _ydl_download(url: str, opts: dict):
         ydl.download([url])
 
 
-def _extract_youtube_id(url: str):
+def _extract_youtube_id(url: str) -> Optional[str]:
     """Return the 11-char video ID from any YouTube URL, or None."""
     if not _re.search(r"(youtube\.com|youtu\.be)", url, _re.IGNORECASE):
         return None
@@ -343,36 +343,6 @@ def _extract_youtube_id(url: str):
         if m:
             return m.group(1)
     return None
-
-
-def _fetch_youtube_transcript(video_id: str) -> str:
-    """Fetch transcript via youtube-transcript-api v1.2.4 and return timestamped text.
-    Uses Webshare rotating residential proxy to bypass cloud IP blocks."""
-    from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api.proxies import WebshareProxyConfig
-
-    proxy_username = os.getenv("WEBSHARE_USERNAME", "njszgbei")
-    proxy_password = os.getenv("WEBSHARE_PASSWORD", "enjsjmjl8qpz")
-
-    proxy_config = WebshareProxyConfig(
-        proxy_username=proxy_username,
-        proxy_password=proxy_password,
-    )
-    api = YouTubeTranscriptApi(proxy_config=proxy_config)
-
-    try:
-        fetched = api.fetch(video_id, languages=["en", "en-US", "en-GB"])
-    except Exception:
-        # Fall back to first available language
-        transcript_list = api.list(video_id)
-        fetched = next(iter(transcript_list)).fetch()
-
-    lines = []
-    for snippet in fetched:
-        secs = int(snippet.start)
-        mins, s = divmod(secs, 60)
-        lines.append(f"[{mins}:{s:02d}] {snippet.text}")
-    return "\n".join(lines)
 
 
 TRANSCRIPT_PROMPT = """
@@ -419,21 +389,27 @@ TRANSCRIPT:
 """
 
 
-async def analyse_youtube_url(ws_id: str, url: str, video_id: str):
-    """Use transcript API for YouTube — no video download needed."""
+async def analyse_youtube_url(ws_id: str, url: str, video_id: str, prefetched_transcript: Optional[str] = None):
+    """Process a YouTube URL using a transcript (pre-fetched by browser, or fetched server-side as fallback)."""
     try:
         if not client:
             raise RuntimeError("GEMINI_API_KEY not configured on server")
 
         await set_stage(ws_id, "transcribing")
-        loop = asyncio.get_event_loop()
-        transcript_text = await loop.run_in_executor(
-            None, lambda: _fetch_youtube_transcript(video_id)
-        )
+
+        if prefetched_transcript and prefetched_transcript.strip():
+            transcript_text = prefetched_transcript
+            print(f"=== USING BROWSER TRANSCRIPT | ws={ws_id} chars={len(transcript_text)} ===")
+        else:
+            raise RuntimeError(
+                "No transcript provided. YouTube requests from this server are blocked. "
+                "Please try again — the browser will fetch the transcript automatically."
+            )
+
         if not transcript_text.strip():
             raise RuntimeError("Transcript is empty — video may have no captions.")
 
-        print(f"=== TRANSCRIPT FETCHED | ws={ws_id} chars={len(transcript_text)} ===")
+        print(f"=== TRANSCRIPT READY | ws={ws_id} chars={len(transcript_text)} ===")
 
         await set_stage(ws_id, "analyzing")
         analysis_resp = await gemini_generate_with_retry(
@@ -455,7 +431,9 @@ async def analyse_youtube_url(ws_id: str, url: str, video_id: str):
         workspace_data["id"]        = ws_id
         workspace_data["createdAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         workspace_data["source"]    = url
-        workspace_data["thumbnail"] = workspace_data.get("thumbnail") or f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+        workspace_data["thumbnail"] = workspace_data.get("thumbnail") or (
+            f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
+        )
 
         await save_workspace(ws_id, workspace_data)
 
@@ -466,23 +444,18 @@ async def analyse_youtube_url(ws_id: str, url: str, video_id: str):
 
 
 async def analyse_url(ws_id: str, url: str):
-    """Route YouTube URLs to transcript path; everything else uses yt-dlp."""
-    video_id = _extract_youtube_id(url)
-    if video_id:
-        print(f"=== YOUTUBE DETECTED | video_id={video_id} ===")
-        await analyse_youtube_url(ws_id, url, video_id)
-        return
-
-    # Non-YouTube: download via yt-dlp as before
+    """Download via yt-dlp then run the same pipeline."""
     try:
         await set_stage(ws_id, "uploading")
 
         tmp = UPLOAD_DIR / f"{ws_id}.mp4"
         ydl_opts = {
+            # Prefer a format that Gemini accepts (H.264 mp4)
             "format": "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "outtmpl": str(tmp),
             "quiet": True,
             "no_warnings": True,
+            # Merge into mp4 so the extension is predictable
             "merge_output_format": "mp4",
         }
         loop = asyncio.get_event_loop()
@@ -545,13 +518,16 @@ async def process_url(
     background_tasks: BackgroundTasks,
     payload: dict,
 ):
-    """Accept a YouTube / video URL, download and process."""
+    """Accept a YouTube / video URL, download and process.
+    If the client sends a 'transcript' field, skip server-side fetching entirely."""
     if not GEMINI_API_KEY:
         raise HTTPException(500, "GEMINI_API_KEY not configured on server")
 
     url = payload.get("url", "").strip()
     if not url:
         raise HTTPException(400, "url is required")
+
+    transcript: Optional[str] = payload.get("transcript") or None
 
     ws_id = f"ws_{uuid.uuid4().hex[:12]}"
 
@@ -562,7 +538,12 @@ async def process_url(
         )
         await db.commit()
 
-    background_tasks.add_task(analyse_url, ws_id, url)
+    if transcript:
+        # Transcript fetched by the browser — skip yt-dlp and transcript API entirely
+        video_id = _extract_youtube_id(url) or ""
+        background_tasks.add_task(analyse_youtube_url, ws_id, url, video_id, transcript)
+    else:
+        background_tasks.add_task(analyse_url, ws_id, url)
     return {"workspaceId": ws_id}
 
 

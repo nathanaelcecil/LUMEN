@@ -8,6 +8,73 @@ import { uploadVideo, submitUrl, pollUntilDone } from "@/lib/api";
 import { takePendingFile } from "@/lib/pending-file";
 import type { ProcessingStatus } from "@/lib/api";
 
+/** Extract YouTube video ID from any YouTube URL, or return null. */
+function extractYouTubeId(url: string): string | null {
+  const patterns = [
+    /[?&]v=([0-9A-Za-z_-]{11})/,
+    /youtu\.be\/([0-9A-Za-z_-]{11})/,
+    /\/embed\/([0-9A-Za-z_-]{11})/,
+    /\/shorts\/([0-9A-Za-z_-]{11})/,
+  ];
+  for (const re of patterns) {
+    const m = url.match(re);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/** Fetch YouTube transcript from the browser (not blocked by YouTube). */
+async function fetchYouTubeTranscriptInBrowser(videoId: string): Promise<string> {
+  // Step 1: fetch the YouTube watch page to get the timedtext URL
+  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    headers: { "Accept-Language": "en-US,en;q=0.9" },
+  });
+  const html = await pageRes.text();
+
+  // Step 2: extract the captionTracks JSON from ytInitialPlayerResponse
+  const match = html.match(/"captionTracks":\s*(\[.*?\])/);
+  if (!match) throw new Error("No captions available for this video.");
+
+  const tracks: Array<{ baseUrl: string; languageCode: string; kind?: string }> =
+    JSON.parse(match[1]);
+
+  // Prefer English ASR (auto-generated) or English manual, then any language
+  const track =
+    tracks.find((t) => t.languageCode === "en" && t.kind === "asr") ||
+    tracks.find((t) => t.languageCode === "en") ||
+    tracks.find((t) => t.languageCode?.startsWith("en")) ||
+    tracks[0];
+
+  if (!track) throw new Error("No caption track found for this video.");
+
+  // Step 3: fetch the XML transcript
+  const xmlRes = await fetch(track.baseUrl + "&fmt=srv3");
+  const xml = await xmlRes.text();
+
+  // Step 4: parse XML into timestamped lines
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xml, "text/xml");
+  const lines: string[] = [];
+  doc.querySelectorAll("text").forEach((node) => {
+    const start = parseFloat(node.getAttribute("start") || "0");
+    const text = node.textContent
+      ?.replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .trim();
+    if (text) {
+      const mins = Math.floor(start / 60);
+      const secs = Math.floor(start % 60);
+      lines.push(`[${mins}:${secs.toString().padStart(2, "0")}] ${text}`);
+    }
+  });
+
+  if (lines.length === 0) throw new Error("Transcript was empty after parsing.");
+  return lines.join("\n");
+}
+
 const STAGE_INDEX: Record<ProcessingStatus["stage"], number> = {
   uploading: 0,
   transcribing: 1,
@@ -52,7 +119,18 @@ export function ProcessingFlow() {
       try {
         let wsId: string;
         if (search.url) {
-          wsId = await submitUrl(search.url);
+          // Fetch transcript in the browser to avoid server-side YouTube IP blocks
+          let transcript: string | undefined;
+          const videoId = extractYouTubeId(search.url);
+          if (videoId) {
+            try {
+              transcript = await fetchYouTubeTranscriptInBrowser(videoId);
+            } catch (e) {
+              // Non-fatal: fall back to server-side handling
+              console.warn("Browser transcript fetch failed, falling back to server:", e);
+            }
+          }
+          wsId = await submitUrl(search.url, transcript);
         } else {
           const file = takePendingFile();
           if (!file) {
