@@ -484,6 +484,79 @@ async def health():
     return {"status": "ok", "gemini_configured": bool(GEMINI_API_KEY)}
 
 
+@app.get("/api/transcript/{video_id}")
+async def get_transcript(video_id: str):
+    """Fetch YouTube caption XML and return timestamped transcript.
+    Called by the frontend to avoid CORS — this server acts as the proxy."""
+    import urllib.request
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Step 1: fetch watch page to get caption track URLs
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    req = urllib.request.Request(watch_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to fetch YouTube page: {exc}")
+
+    import re
+    match = re.search(r'"captionTracks":\s*(\[.*?\])', html)
+    if not match:
+        raise HTTPException(404, "No captions available for this video.")
+
+    import json as _json
+    try:
+        tracks = _json.loads(match.group(1))
+    except Exception:
+        raise HTTPException(500, "Failed to parse caption tracks.")
+
+    # Prefer English, fall back to first available
+    track = (
+        next((t for t in tracks if t.get("languageCode") == "en" and t.get("kind") == "asr"), None)
+        or next((t for t in tracks if t.get("languageCode") == "en"), None)
+        or next((t for t in tracks if t.get("languageCode", "").startswith("en")), None)
+        or (tracks[0] if tracks else None)
+    )
+    if not track:
+        raise HTTPException(404, "No caption track found.")
+
+    # Step 2: fetch the caption XML
+    caption_url = track["baseUrl"] + "&fmt=srv3"
+    req2 = urllib.request.Request(caption_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req2, timeout=15) as resp:
+            xml = resp.read().decode("utf-8", errors="ignore")
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to fetch captions: {exc}")
+
+    # Step 3: parse XML into timestamped lines
+    from xml.etree import ElementTree as ET
+    import html as _html
+    try:
+        root = ET.fromstring(xml)
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to parse caption XML: {exc}")
+
+    lines = []
+    for node in root.iter("text"):
+        start = float(node.get("start", 0))
+        text = _html.unescape(node.text or "").strip()
+        if text:
+            mins = int(start // 60)
+            secs = int(start % 60)
+            lines.append(f"[{mins}:{secs:02d}] {text}")
+
+    if not lines:
+        raise HTTPException(404, "Transcript was empty after parsing.")
+
+    return {"transcript": "\n".join(lines)}
+
+
 @app.post("/api/workspaces/upload")
 async def upload_video(
     background_tasks: BackgroundTasks,

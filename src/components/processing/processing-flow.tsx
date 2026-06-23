@@ -23,56 +23,16 @@ function extractYouTubeId(url: string): string | null {
   return null;
 }
 
-/** Fetch YouTube transcript from the browser (not blocked by YouTube). */
+/** Fetch YouTube transcript via our own backend proxy (avoids CORS + YouTube IP blocks). */
 async function fetchYouTubeTranscriptInBrowser(videoId: string): Promise<string> {
-  // Step 1: fetch the YouTube watch page to get the timedtext URL
-  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: { "Accept-Language": "en-US,en;q=0.9" },
-  });
-  const html = await pageRes.text();
-
-  // Step 2: extract the captionTracks JSON from ytInitialPlayerResponse
-  const match = html.match(/"captionTracks":\s*(\[.*?\])/);
-  if (!match) throw new Error("No captions available for this video.");
-
-  const tracks: Array<{ baseUrl: string; languageCode: string; kind?: string }> =
-    JSON.parse(match[1]);
-
-  // Prefer English ASR (auto-generated) or English manual, then any language
-  const track =
-    tracks.find((t) => t.languageCode === "en" && t.kind === "asr") ||
-    tracks.find((t) => t.languageCode === "en") ||
-    tracks.find((t) => t.languageCode?.startsWith("en")) ||
-    tracks[0];
-
-  if (!track) throw new Error("No caption track found for this video.");
-
-  // Step 3: fetch the XML transcript
-  const xmlRes = await fetch(track.baseUrl + "&fmt=srv3");
-  const xml = await xmlRes.text();
-
-  // Step 4: parse XML into timestamped lines
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(xml, "text/xml");
-  const lines: string[] = [];
-  doc.querySelectorAll("text").forEach((node) => {
-    const start = parseFloat(node.getAttribute("start") || "0");
-    const text = node.textContent
-      ?.replace(/&#39;/g, "'")
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"')
-      .trim();
-    if (text) {
-      const mins = Math.floor(start / 60);
-      const secs = Math.floor(start % 60);
-      lines.push(`[${mins}:${secs.toString().padStart(2, "0")}] ${text}`);
-    }
-  });
-
-  if (lines.length === 0) throw new Error("Transcript was empty after parsing.");
-  return lines.join("\n");
+  const BASE = (import.meta as any).env?.VITE_API_URL ?? "http://localhost:8000";
+  const res = await fetch(`${BASE}/api/transcript/${videoId}`);
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || "Transcript fetch failed");
+  }
+  const data = await res.json();
+  return data.transcript as string;
 }
 
 const STAGE_INDEX: Record<ProcessingStatus["stage"], number> = {
