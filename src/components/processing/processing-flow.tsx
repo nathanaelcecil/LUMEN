@@ -8,14 +8,12 @@ import { uploadVideo, submitUrl, pollUntilDone } from "@/lib/api";
 import { takePendingFile } from "@/lib/pending-file";
 import type { ProcessingStatus } from "@/lib/api";
 
-// ─── Extension configuration ────────────────────────────────────────────────
-// Replace this with your published extension's ID from the Chrome Web Store.
-// During development, copy the ID from chrome://extensions after loading unpacked.
+// ─── Extension configuration ─────────────────────────────────────────────────
 const EXTENSION_ID = (import.meta as any).env?.VITE_LUMEN_EXTENSION_ID ?? "ondbmdckagdlcbllnjnbidckbnlclfoe";
 
 const EXTENSION_TIMEOUT_MS = 15_000;
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Extract YouTube video ID from any YouTube URL, or return null. */
 function extractYouTubeId(url: string): string | null {
@@ -32,33 +30,62 @@ function extractYouTubeId(url: string): string | null {
   return null;
 }
 
-/** Check whether the Lumen Companion Chrome extension is installed and responding. */
+/**
+ * Send a single PING to the extension and return true if it responds.
+ * Does NOT throw — always resolves to a boolean.
+ */
+function pingExtension(): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    if (typeof chrome === "undefined" || !chrome?.runtime?.sendMessage) {
+      resolve(false);
+      return;
+    }
+
+    // Guard: if the extension isn't installed at all, Chrome fires lastError
+    // synchronously in the callback instead of throwing. We must read it to
+    // prevent an uncaught error in the console.
+    const timeoutId = setTimeout(() => resolve(false), 2_000);
+
+    try {
+      chrome.runtime.sendMessage(
+        EXTENSION_ID,
+        { type: "PING" },
+        (response) => {
+          clearTimeout(timeoutId);
+          if (chrome.runtime.lastError) {
+            // Extension not installed, wrong ID, or not externally connectable
+            resolve(false);
+          } else {
+            resolve(response?.pong === true);
+          }
+        }
+      );
+    } catch {
+      clearTimeout(timeoutId);
+      resolve(false);
+    }
+  });
+}
+
+/**
+ * Check whether the Lumen Companion Chrome extension is installed and responding.
+ * Retries up to 3 times with a 600 ms gap to handle cold service-worker wakeup
+ * (the worker can take 100–400 ms to boot and register its listener after the
+ * first message wakes it).
+ */
 async function isExtensionInstalled(): Promise<boolean> {
-  if (typeof chrome === "undefined" || !chrome?.runtime?.sendMessage) return false;
-  try {
-    const result = await Promise.race<any>([
-      new Promise((resolve) =>
-        chrome.runtime.sendMessage(EXTENSION_ID, { type: "PING" }, (response) => {
-          if (chrome.runtime.lastError) resolve(null);
-          else resolve(response);
-        })
-      ),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("timeout")), 2_000)
-      ),
-    ]);
-    // Any non-null response (even an error object) means the extension is installed
-    return result !== null && result !== undefined;
-  } catch {
-    return false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (await pingExtension()) return true;
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 600));
   }
+  return false;
 }
 
 /**
  * Ask the Lumen Companion extension to fetch the YouTube transcript.
  * Returns the transcript string on success.
- * Throws an error whose message starts with "NO_CAPTIONS" if the video
- * has no captions, or "EXTENSION_MISSING" if the extension isn't installed.
+ * Throws an error whose message starts with "NO_CAPTIONS" if the video has no
+ * captions, or "EXTENSION_MISSING" if the extension isn't installed / responding.
  */
 async function fetchTranscriptFromExtension(videoId: string): Promise<string> {
   if (typeof chrome === "undefined" || !chrome?.runtime?.sendMessage) {
@@ -67,17 +94,21 @@ async function fetchTranscriptFromExtension(videoId: string): Promise<string> {
 
   const response = await Promise.race<any>([
     new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage(
-        EXTENSION_ID,
-        { type: "GET_TRANSCRIPT", videoId },
-        (res) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error("EXTENSION_MISSING: " + chrome.runtime.lastError.message));
-          } else {
-            resolve(res);
+      try {
+        chrome.runtime.sendMessage(
+          EXTENSION_ID,
+          { type: "GET_TRANSCRIPT", videoId },
+          (res) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error("EXTENSION_MISSING: " + chrome.runtime.lastError.message));
+            } else {
+              resolve(res);
+            }
           }
-        }
-      );
+        );
+      } catch (err: any) {
+        reject(new Error("EXTENSION_MISSING: " + (err?.message ?? String(err))));
+      }
     }),
     new Promise((_, reject) =>
       setTimeout(
@@ -104,7 +135,7 @@ async function fetchTranscriptFromExtension(videoId: string): Promise<string> {
   return response.transcript as string;
 }
 
-// ─── Stage config ─────────────────────────────────────────────────────────────
+// ─── Stage config ──────────────────────────────────────────────────────────────
 
 const STAGE_INDEX: Record<ProcessingStatus["stage"], number> = {
   uploading: 0,
@@ -233,7 +264,20 @@ export function ProcessingFlow() {
           let transcript: string | undefined;
 
           if (videoId) {
-            // Always use the extension for YouTube URLs
+            // ── Step 1: check the extension is actually there before trying ──
+            // This runs BEFORE fetchTranscriptFromExtension so we show the
+            // "Extension required" card immediately instead of waiting 15 s for
+            // the transcript timeout to fire.
+            const installed = await isExtensionInstalled();
+            if (!installed) {
+              if (!cancelled) {
+                setError("EXTENSION_MISSING: Extension not detected.");
+                setErrorKind("extension_missing");
+              }
+              return;
+            }
+
+            // ── Step 2: fetch the transcript via the extension ────────────────
             try {
               transcript = await fetchTranscriptFromExtension(videoId);
             } catch (e: any) {
@@ -295,7 +339,7 @@ export function ProcessingFlow() {
 
   const progressPct = complete ? 100 : Math.min(95, (stageIndex / STAGES.length) * 100);
 
-  // ── Error states ──────────────────────────────────────────────────────────
+  // ── Error states ───────────────────────────────────────────────────────────
 
   if (error && errorKind === "extension_missing") {
     return (
@@ -333,7 +377,7 @@ export function ProcessingFlow() {
     );
   }
 
-  // ── Processing UI ─────────────────────────────────────────────────────────
+  // ── Processing UI ──────────────────────────────────────────────────────────
 
   return (
     <div className="mx-auto flex w-full max-w-sm flex-col items-center text-center">
