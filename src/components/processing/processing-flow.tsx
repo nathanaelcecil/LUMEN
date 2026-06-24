@@ -11,7 +11,7 @@ import type { ProcessingStatus } from "@/lib/api";
 // ─── Extension configuration ────────────────────────────────────────────────
 // Replace this with your published extension's ID from the Chrome Web Store.
 // During development, copy the ID from chrome://extensions after loading unpacked.
-const EXTENSION_ID = (import.meta as any).env?.VITE_LUMEN_EXTENSION_ID ?? "YOUR_EXTENSION_ID_HERE";
+const EXTENSION_ID = (import.meta as any).env?.VITE_LUMEN_EXTENSION_ID ?? "ondbmdckagdlcbllnjnbidckbnlclfoe";
 
 const EXTENSION_TIMEOUT_MS = 15_000;
 
