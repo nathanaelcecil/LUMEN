@@ -9,7 +9,7 @@ import { takePendingFile } from "@/lib/pending-file";
 import type { ProcessingStatus } from "@/lib/api";
 
 // ─── Extension configuration ─────────────────────────────────────────────────
-const EXTENSION_ID = (import.meta as any).env?.VITE_LUMEN_EXTENSION_ID ?? "ondbmdckagdlcbllnjnbidckbnlclfoe";
+const EXTENSION_ID = "ondbmdckagdlcbllnjnbidckbnlclfoe";
 
 const EXTENSION_TIMEOUT_MS = 15_000;
 
