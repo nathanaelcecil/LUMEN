@@ -4,9 +4,8 @@ Powered by Google Gemini for transcription + analysis.
 SQLite for workspace storage.
 
 ARCHITECTURE NOTE:
-YouTube transcripts are fetched client-side via the Lumen Companion Chrome
-extension and passed to /api/workspaces/url in the `transcript` field.
-The server never contacts YouTube directly for transcript data.
+YouTube transcripts are fetched server-side via youtube-transcript-api.
+If a client sends a pre-fetched transcript it is used directly (legacy extension support).
 yt-dlp is retained ONLY for non-YouTube generic video URLs.
 """
 
@@ -22,6 +21,7 @@ from typing import Optional
 import aiosqlite
 import aiofiles
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -403,10 +403,25 @@ async def analyse_youtube_url(ws_id: str, url: str, video_id: str, prefetched_tr
             transcript_text = prefetched_transcript
             print(f"=== USING BROWSER TRANSCRIPT | ws={ws_id} chars={len(transcript_text)} ===")
         else:
-            raise RuntimeError(
-                "Transcript unavailable. Install the Lumen Companion extension or "
-                "upload the video file directly."
-            )
+            # Fetch transcript server-side using youtube-transcript-api
+            print(f"=== FETCHING TRANSCRIPT SERVER-SIDE | ws={ws_id} video={video_id} ===")
+            try:
+                loop = asyncio.get_event_loop()
+                transcript_list = await loop.run_in_executor(
+                    None,
+                    lambda: YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US", "en-GB"])
+                )
+                transcript_text = "\n".join(
+                    f"[{int(entry['start'] // 60)}:{int(entry['start'] % 60):02d}] {entry['text']}"
+                    for entry in transcript_list
+                )
+                print(f"=== SERVER TRANSCRIPT READY | ws={ws_id} chars={len(transcript_text)} ===")
+            except (TranscriptsDisabled, NoTranscriptFound):
+                raise RuntimeError(
+                    "This video has no captions available. Please upload the video file directly."
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Could not fetch transcript: {exc}")
 
         if not transcript_text.strip():
             raise RuntimeError("Transcript is empty — video may have no captions.")
@@ -488,24 +503,22 @@ async def health():
 
 @app.get("/api/transcript/{video_id}")
 async def get_transcript(video_id: str):
-    """
-    DEPRECATED — this endpoint is no longer used.
-
-    YouTube transcripts are now fetched client-side by the Lumen Companion
-    Chrome extension, which is not subject to YouTube's server-IP blocks.
-    The transcript is passed directly to POST /api/workspaces/url as the
-    `transcript` field.
-
-    This stub is retained so that any clients still calling this route receive
-    a clear error instead of a 404.
-    """
-    raise HTTPException(
-        410,
-        detail=(
-            "Transcript unavailable. Install the Lumen Companion extension or "
-            "upload the video file directly."
-        ),
-    )
+    """Fetch a YouTube transcript server-side."""
+    try:
+        loop = asyncio.get_event_loop()
+        transcript_list = await loop.run_in_executor(
+            None,
+            lambda: YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US", "en-GB"])
+        )
+        transcript_text = "\n".join(
+            f"[{int(e['start'] // 60)}:{int(e['start'] % 60):02d}] {e['text']}"
+            for e in transcript_list
+        )
+        return {"transcript": transcript_text}
+    except (TranscriptsDisabled, NoTranscriptFound):
+        raise HTTPException(404, "No captions available for this video.")
+    except Exception as exc:
+        raise HTTPException(500, f"Could not fetch transcript: {exc}")
 
 @app.post("/api/workspaces/upload")
 async def upload_video(
@@ -564,19 +577,6 @@ async def process_url(
     is_youtube = bool(_extract_youtube_id(url))
 
     if is_youtube:
-        if not transcript:
-            # Delete the workspace row we just inserted — nothing to process
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("DELETE FROM workspaces WHERE id=?", (ws_id,))
-                await db.commit()
-            raise HTTPException(
-                422,
-                detail=(
-                    "Transcript unavailable. Install the Lumen Companion extension or "
-                    "upload the video file directly."
-                ),
-            )
-        # Transcript fetched by the browser extension — skip yt-dlp entirely
         video_id = _extract_youtube_id(url) or ""
         background_tasks.add_task(analyse_youtube_url, ws_id, url, video_id, transcript)
     else:
