@@ -1,12 +1,21 @@
 import * as React from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { motion, AnimatePresence } from "framer-motion";
-import { Check, AlertCircle, Brain, Mic2, Layers, Wand2 } from "lucide-react";
+import { Check, AlertCircle, Brain, Mic2, Layers, Wand2, Puzzle, Download } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { setWorkspace } from "@/lib/workspace-store";
 import { uploadVideo, submitUrl, pollUntilDone } from "@/lib/api";
 import { takePendingFile } from "@/lib/pending-file";
 import type { ProcessingStatus } from "@/lib/api";
+
+// ─── Extension configuration ────────────────────────────────────────────────
+// Replace this with your published extension's ID from the Chrome Web Store.
+// During development, copy the ID from chrome://extensions after loading unpacked.
+const EXTENSION_ID = (import.meta as any).env?.VITE_LUMEN_EXTENSION_ID ?? "YOUR_EXTENSION_ID_HERE";
+
+const EXTENSION_TIMEOUT_MS = 15_000;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Extract YouTube video ID from any YouTube URL, or return null. */
 function extractYouTubeId(url: string): string | null {
@@ -23,17 +32,79 @@ function extractYouTubeId(url: string): string | null {
   return null;
 }
 
-/** Fetch YouTube transcript via our own backend proxy (avoids CORS + YouTube IP blocks). */
-async function fetchYouTubeTranscriptInBrowser(videoId: string): Promise<string> {
-  const BASE = (import.meta as any).env?.VITE_API_URL ?? "http://localhost:8000";
-  const res = await fetch(`${BASE}/api/transcript/${videoId}`);
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err || "Transcript fetch failed");
+/** Check whether the Lumen Companion Chrome extension is installed and responding. */
+async function isExtensionInstalled(): Promise<boolean> {
+  if (typeof chrome === "undefined" || !chrome?.runtime?.sendMessage) return false;
+  try {
+    const result = await Promise.race<any>([
+      new Promise((resolve) =>
+        chrome.runtime.sendMessage(EXTENSION_ID, { type: "PING" }, (response) => {
+          if (chrome.runtime.lastError) resolve(null);
+          else resolve(response);
+        })
+      ),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), 2_000)
+      ),
+    ]);
+    // Any non-null response (even an error object) means the extension is installed
+    return result !== null && result !== undefined;
+  } catch {
+    return false;
   }
-  const data = await res.json();
-  return data.transcript as string;
 }
+
+/**
+ * Ask the Lumen Companion extension to fetch the YouTube transcript.
+ * Returns the transcript string on success.
+ * Throws an error whose message starts with "NO_CAPTIONS" if the video
+ * has no captions, or "EXTENSION_MISSING" if the extension isn't installed.
+ */
+async function fetchTranscriptFromExtension(videoId: string): Promise<string> {
+  if (typeof chrome === "undefined" || !chrome?.runtime?.sendMessage) {
+    throw new Error("EXTENSION_MISSING: Chrome extension API not available.");
+  }
+
+  const response = await Promise.race<any>([
+    new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(
+        EXTENSION_ID,
+        { type: "GET_TRANSCRIPT", videoId },
+        (res) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error("EXTENSION_MISSING: " + chrome.runtime.lastError.message));
+          } else {
+            resolve(res);
+          }
+        }
+      );
+    }),
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error("EXTENSION_MISSING: Extension did not respond in time.")),
+        EXTENSION_TIMEOUT_MS
+      )
+    ),
+  ]);
+
+  if (!response) {
+    throw new Error("EXTENSION_MISSING: No response from extension.");
+  }
+
+  if (!response.success) {
+    const msg: string = response.error || "Unknown extension error";
+    if (msg.startsWith("NO_CAPTIONS")) throw new Error(msg);
+    throw new Error("EXTENSION_MISSING: " + msg);
+  }
+
+  if (!response.transcript) {
+    throw new Error("NO_CAPTIONS: Transcript returned by extension was empty.");
+  }
+
+  return response.transcript as string;
+}
+
+// ─── Stage config ─────────────────────────────────────────────────────────────
 
 const STAGE_INDEX: Record<ProcessingStatus["stage"], number> = {
   uploading: 0,
@@ -58,6 +129,80 @@ const tickerLines = [
   "Finalizing your study workspace…",
 ];
 
+// ─── Extension-missing card ───────────────────────────────────────────────────
+
+function ExtensionRequiredCard({ onDismiss }: { onDismiss?: () => void }) {
+  return (
+    <div className="mx-auto flex w-full max-w-sm flex-col items-center text-center gap-5">
+      <div className="flex h-14 w-14 items-center justify-center rounded-full border border-marker/30 bg-marker/10 text-marker">
+        <Puzzle className="h-6 w-6" />
+      </div>
+      <div>
+        <h2 className="font-display text-lg font-semibold">Extension required</h2>
+        <p className="mt-2 text-[13px] text-ink-muted leading-relaxed">
+          The <strong>Lumen Companion</strong> Chrome extension is required to fetch
+          YouTube transcripts. It fetches captions directly from YouTube on your behalf,
+          bypassing server-side IP blocks.
+        </p>
+      </div>
+      <a
+        href="https://chrome.google.com/webstore/detail/lumen-companion/YOUR_EXTENSION_ID_HERE"
+        target="_blank"
+        rel="noopener noreferrer"
+        className="flex items-center gap-2 rounded-lg bg-marker px-5 py-2.5 text-[13px] font-semibold text-marker-foreground hover:opacity-90 transition-opacity"
+      >
+        <Download className="h-4 w-4" />
+        Install Extension
+      </a>
+      <p className="text-[11px] text-ink-faint">
+        Already installed?{" "}
+        <button
+          onClick={onDismiss}
+          className="underline underline-offset-2 hover:text-ink transition-colors"
+        >
+          Try again
+        </button>
+      </p>
+      <p className="text-[11px] text-ink-faint -mt-2">
+        Or go back and{" "}
+        <a href="/upload" className="underline underline-offset-2 hover:text-ink transition-colors">
+          upload the video file
+        </a>{" "}
+        directly.
+      </p>
+    </div>
+  );
+}
+
+// ─── No-captions card ─────────────────────────────────────────────────────────
+
+function NoCaptionsCard() {
+  return (
+    <div className="mx-auto flex w-full max-w-sm flex-col items-center text-center gap-5">
+      <div className="flex h-14 w-14 items-center justify-center rounded-full border border-destructive/30 bg-destructive/10 text-destructive">
+        <AlertCircle className="h-6 w-6" />
+      </div>
+      <div>
+        <h2 className="font-display text-lg font-semibold">No captions available</h2>
+        <p className="mt-2 text-[13px] text-ink-muted leading-relaxed">
+          This video has no captions available. Please upload the video file directly
+          so Lumen can transcribe the audio using Gemini.
+        </p>
+      </div>
+      <a
+        href="/upload"
+        className="rounded-lg bg-marker px-5 py-2.5 text-[13px] font-semibold text-marker-foreground hover:opacity-90 transition-opacity"
+      >
+        Upload video file
+      </a>
+    </div>
+  );
+}
+
+// ─── Main component ───────────────────────────────────────────────────────────
+
+type ErrorKind = "generic" | "extension_missing" | "no_captions";
+
 export function ProcessingFlow() {
   const navigate = useNavigate();
   const search = useSearch({ strict: false }) as { name?: string; url?: string };
@@ -67,6 +212,8 @@ export function ProcessingFlow() {
   const [lineIndex, setLineIndex] = React.useState(0);
   const [complete, setComplete] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [errorKind, setErrorKind] = React.useState<ErrorKind>("generic");
+  const [retryCount, setRetryCount] = React.useState(0);
 
   React.useEffect(() => {
     const t = setInterval(() => setLineIndex((i) => (i + 1) % tickerLines.length), 2200);
@@ -75,21 +222,44 @@ export function ProcessingFlow() {
 
   React.useEffect(() => {
     let cancelled = false;
+
     async function run() {
       try {
         let wsId: string;
+
         if (search.url) {
-          // Fetch transcript in the browser to avoid server-side YouTube IP blocks
-          let transcript: string | undefined;
           const videoId = extractYouTubeId(search.url);
+
+          let transcript: string | undefined;
+
           if (videoId) {
+            // Always use the extension for YouTube URLs
             try {
-              transcript = await fetchYouTubeTranscriptInBrowser(videoId);
-            } catch (e) {
-              // Non-fatal: fall back to server-side handling
-              console.warn("Browser transcript fetch failed, falling back to server:", e);
+              transcript = await fetchTranscriptFromExtension(videoId);
+            } catch (e: any) {
+              const msg: string = e?.message ?? "";
+
+              if (msg.startsWith("NO_CAPTIONS")) {
+                if (!cancelled) {
+                  setError(msg);
+                  setErrorKind("no_captions");
+                }
+                return;
+              }
+
+              if (msg.startsWith("EXTENSION_MISSING")) {
+                if (!cancelled) {
+                  setError(msg);
+                  setErrorKind("extension_missing");
+                }
+                return;
+              }
+
+              // Unexpected extension error — surface it
+              throw e;
             }
           }
+
           wsId = await submitUrl(search.url, transcript);
         } else {
           const file = takePendingFile();
@@ -98,22 +268,50 @@ export function ProcessingFlow() {
           }
           wsId = await uploadVideo(file);
         }
+
         const workspace = await pollUntilDone(wsId, (stage) => {
           if (!cancelled) setStageIndex(STAGE_INDEX[stage] ?? 0);
         });
+
         if (cancelled) return;
         setWorkspace(workspace);
         setComplete(true);
-        setTimeout(() => { if (!cancelled) navigate({ to: "/dashboard" }); }, 900);
+        setTimeout(() => {
+          if (!cancelled) navigate({ to: "/dashboard" });
+        }, 900);
       } catch (err: any) {
-        if (!cancelled) setError(err?.message ?? "Something went wrong");
+        if (!cancelled) {
+          setError(err?.message ?? "Something went wrong");
+          setErrorKind("generic");
+        }
       }
     }
+
     run();
-    return () => { cancelled = true; };
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [retryCount]);
 
   const progressPct = complete ? 100 : Math.min(95, (stageIndex / STAGES.length) * 100);
+
+  // ── Error states ──────────────────────────────────────────────────────────
+
+  if (error && errorKind === "extension_missing") {
+    return (
+      <ExtensionRequiredCard
+        onDismiss={() => {
+          setError(null);
+          setErrorKind("generic");
+          setRetryCount((c) => c + 1);
+        }}
+      />
+    );
+  }
+
+  if (error && errorKind === "no_captions") {
+    return <NoCaptionsCard />;
+  }
 
   if (error) {
     return (
@@ -134,6 +332,8 @@ export function ProcessingFlow() {
       </div>
     );
   }
+
+  // ── Processing UI ─────────────────────────────────────────────────────────
 
   return (
     <div className="mx-auto flex w-full max-w-sm flex-col items-center text-center">
